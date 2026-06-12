@@ -116,11 +116,11 @@ def create_db():
 os.makedirs("backups", exist_ok = True) 
 os.makedirs("cache", exist_ok = True)
 
-def heartbeat_monitoring():
+def heartbeat_monitoring(active_users):
 
     while True:
     
-        with user in active_users.values():
+        for user in active_users.values():
 
             with user.lock:
 
@@ -139,7 +139,7 @@ def heartbeat_monitoring():
                         pass
         time.sleep(5)
 
-ffmpeg_process = subprocess.Popen()
+
 def backup():
 
     while True:
@@ -162,10 +162,6 @@ backup_thread = threading.Thread(
     daemon=True
 )
 
-threading.Thread(
-    target = heartbeat_monitoring,
-    daemon = True
-).start()
 
 backup_thread.start()
 #loading songs into the database
@@ -204,7 +200,7 @@ class userState:
         self.queue = []
         self.buffer_health = 100
         self.client_socket = None
-        self.stop_stream = None
+        self.stop_stream = False
         self.stream_thread = False
         self.lock = threading.Lock()
         self.socket_version = 0
@@ -285,6 +281,7 @@ def stream_song(user):
     
     path = os.path.join("songs", user.current_song)
     print("Current Song:", user.current_song)
+    print("SIZE:", os.path.getsize(path))  
 
     if os.path.exists(path):
 
@@ -304,6 +301,7 @@ def stream_song(user):
                     with user.lock:
                         if not user.stop_stream:
                             break
+                    print("STREAM STOPPED")
                     time.sleep(0.1)
                 
                 try:
@@ -311,10 +309,8 @@ def stream_song(user):
                         if user.socket_version != curr_version:
                             return
                     
-                    user.client_socket.send(data)
-
-                    with user.lock:
-                        user.buffer_health = min(100, user.buffer_health + 2)
+                    user.client_socket.sendall(data)
+                    time.sleep(0.1)
 
                 except OSError:
                     print(f"Client disconnected while streaming {user.current_song}.mp3 at chunk:", user.position)
@@ -324,15 +320,15 @@ def stream_song(user):
                 with user.lock:
                     user.position += 1
 
-                if user.buffer_health < 30:
-                    delay = 1.5
-                elif user.buffer_health > 80:
-                    delay = 0.5
-                else:
-                    delay = 1
+                        
+            try:
+                user.client_socket.sendall(b"EOF")
+                return
+            except:
+                pass
 
-                time.sleep(delay)
-        user.client_socket.send('EOF'.encode())
+
+
         with user.lock:
             user.socket_version += 1
 
@@ -346,7 +342,7 @@ def stream_song(user):
                 user.current_song = None
                 user.position = 0
                 return
-            
+         
         if start_next:
             threading.Thread(
                 target = stream_song,
@@ -357,12 +353,11 @@ def stream_song(user):
         user.client_socket.send("Song not found".encode())
 
 
-
-
 def talk_to_client(server_client, address, user):
     if user is None:
         server_client.close()
         return
+    
     
     print("ENTERED THREAD")
     print("SESSION ID:" + str(user.sessionId))
@@ -371,14 +366,17 @@ def talk_to_client(server_client, address, user):
     
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
+    print("connected to:", address)
     while True:
         try:
-            print("connected to:", address)
             message = server_client.recv(1024).decode()
             if not message:
                 print("client disconnected")
                 break
-            print("client says:", message)
+
+            if message != "HEARTBEAT":
+                print("client says:", message)
+            
             # Handle client messages and commands here
             if message == "LIST":
                     cursor.execute("""
@@ -449,6 +447,7 @@ def talk_to_client(server_client, address, user):
 
 
             elif message == "PAUSE":
+                print("Pause Recieved")
                 with user.lock:
                     user.stop_stream = True
                     user.buffer_health = max(0, user.buffer_health - 10) 
@@ -748,8 +747,9 @@ while True:
                     user = active_users[session_id]
 
 
-                    old_socket = user.client_socket
-                    user.client_socket = server_client
+                    with user.lock:
+                        old_socket = user.client_socket
+                        user.client_socket = server_client
                     try:
                         if old_socket:
                             old_socket.close()
@@ -764,7 +764,8 @@ while True:
 
                     threading.Thread(
                         target = stream_song,
-                        args = (user,)
+                        args = (user,),
+                        daemon=True
                     ).start()
 
                 else:
@@ -800,6 +801,13 @@ while True:
             )
     
             thread.start()
+
+            
+            threading.Thread(
+                target = heartbeat_monitoring,
+                args = (active_users,),
+                daemon = True
+            ).start()
         else:
 
             thread = threading.Thread(
