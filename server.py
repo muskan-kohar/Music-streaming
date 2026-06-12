@@ -301,7 +301,7 @@ def stream_song(user):
                     with user.lock:
                         if not user.stop_stream:
                             break
-                    print("STREAM STOPPED")
+
                     time.sleep(0.1)
                 
                 try:

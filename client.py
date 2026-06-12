@@ -43,7 +43,9 @@ threading.Thread(
     daemon = True
 ).start()
         
-        
+pause = False      
+
+
 ffmpeg_process = subprocess.Popen(
     [ "ffmpeg",
     "-i", "pipe:0",
@@ -71,20 +73,34 @@ stream = p_aud.open(
 
 )
 def get_stream():
+    global pause
     print("Get stream started")
     while True:
+
+        while pause:
+            time.sleep(0.1)
+
+
         audio_chunk = audio_queue.get()
 
-        print("GOT CHUNK", len(audio_chunk))
 
-        ffmpeg_process.stdin.write(audio_chunk)
-        ffmpeg_process.stdin.flush()
+        try:
+            ffmpeg_process.stdin.write(audio_chunk)
+            ffmpeg_process.stdin.flush()
+        except Exception as e:
+            print("INPUT ERROR IN FFMPEG:", e)
+            break
 
-        print("SENT TO FFMPEG") 
+
 
 def out_stream():
     print("Out stream started")
     while True:
+
+        while pause:
+            time.sleep(0.1)
+
+
         pcm_bite = ffmpeg_process.stdout.read(1024)
                 
         if not pcm_bite:
@@ -149,10 +165,9 @@ if auth == "SUCCESS":
 
             audio_queue.put(data, timeout=1)
 
-            print("Audio buffer queuesize:" , audio_queue.qsize())
+            
 
         print("TOTAL RECIEVED:" , total)
-
 
 
     
@@ -191,7 +206,10 @@ if auth == "SUCCESS":
             exit()
 
         elif choice == "3":
+            print("Queue size:", audio_queue.qsize())
+            
             client.send("PAUSE".encode())
+            pause = True
 
 
         elif choice == "4":
@@ -241,6 +259,7 @@ if auth == "SUCCESS":
 
         elif choice == "8":
             client.send("RESUME".encode())
+            pause = False
 
         elif choice == "9":
             message = input("Enter the song you want to add to queue:\n")
