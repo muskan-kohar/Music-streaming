@@ -120,7 +120,7 @@ def heartbeat_monitoring(active_users):
 
     while True:
     
-        for user in active_users.values():
+        for user in list(active_users.values()):
 
             with user.lock:
 
@@ -131,6 +131,9 @@ def heartbeat_monitoring(active_users):
                 
                 
                     try:
+
+                        cleanup_user()
+
                         if user.client_socket:
                             user.client_socket.close()
                             user.connected = False
@@ -160,10 +163,9 @@ def backup():
 backup_thread = threading.Thread(
     target = backup,
     daemon=True
-)
+).start()
 
 
-backup_thread.start()
 #loading songs into the database
 def load_songs():
     conn = sqlite3.connect("users.db")
@@ -277,61 +279,142 @@ def login(username, password):
             return False       
 
 
-def stream_song(user):
+def cleanup_user(user):
+    try:
+        with user.lock:
+            user.connected = False
+            user.socket_version += 1
+            user.stop_stream = True
+
+            active_users.pop(user.sessionId, None)
+
+            print("Cleane up user:", user.sessionId)
+
+    except Exception as e:
+        print("Cleanup error", e)
+
+
+def create_ffmpeg():
+    ffmpeg_process = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-i", "pipe:0",
+            "-f", "s16le",
+            "-acodec", "pcm_s16le",
+            "-ac", "2",
+            "-ar", "48000",
+            "pipe:1"
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    return ffmpeg_process
+
+def ffmpeg_errors(ffmpeg_process):
+    
+    while True:
+        error = ffmpeg_process.stderr.readline()
+        if error:
+            print("FFMPEG ERROR:", error.decode())
+        else:
+            break
+
+
+def send_pcm(user, ffmpeg_process):
+    while True:
+        data = ffmpeg_process.stdout.read(1024)
+        if not data:
+            break
+
+
+        user.client_socket.sendall(data)
+
+    try:
+        #sending EOF to the client to indicate the end of the song
+        user.client_socket.sendall(b"END OF SONG")
+        ffmpeg_process.stdin.close() 
+        return
+    except:
+        pass
+
+
+
+
+# defining a function to stream the song to the client
+def stream_song(user, ffmpeg_process):
     
     path = os.path.join("songs", user.current_song)
     print("Current Song:", user.current_song)
-    print("SIZE:", os.path.getsize(path))  
+    size = os.path.getsize(path)
+    print("SIZE:", size)
+
 
     if os.path.exists(path):
 
         print(f"Sending {user.current_song} chunk from:", user.position)
-        with open(path, "rb") as file:
-            with user.lock:
-                offset = 4096*user.position
-            file.seek(offset)
-            data = file.read(4096)
-
-            curr_version = user.socket_version 
-
-
-
-            while data:
-                while True:
-                    with user.lock:
-                        if not user.stop_stream:
-                            break
-
-                    time.sleep(0.1)
-                
-                try:
-                    with user.lock:
-                        if user.socket_version != curr_version:
-                            return
-                    
-                    user.client_socket.sendall(data)
-                    time.sleep(0.1)
-
-                except OSError:
-                    print(f"Client disconnected while streaming {user.current_song}.mp3 at chunk:", user.position)
-                    return
-                        
-                data = file.read(4096)
+        
+        try:
+            #reading the song file and sending it to the client in chunks
+            with open(path, "rb") as file:
                 with user.lock:
-                    user.position += 1
+                    offset = 1024*user.position
+                file.seek(offset)
 
-                        
-            try:
-                user.client_socket.sendall(b"EOF")
-                return
-            except:
-                pass
+                
 
+
+                while True:
+                    data = file.read(1024)
+                    
+
+                    if not data:
+                        ffmpeg_process.stdin.close()
+                        print(f"End of file reached for {user.current_song}")
+                        return
+        
+                    ffmpeg_process.stdin.write(data)
+
+
+                    ffmpeg_process.stdin.flush()
+                
+                    curr_version = user.socket_version 
+
+
+
+                    with user.lock:
+                        if user.stop_stream:
+                            print(f"Streaming paused for {user.current_song} at chunk:", user.position)
+                            time.sleep(0.1)
+                            continue
+
+                    try:
+                        with user.lock:
+                            if user.socket_version != curr_version:
+                                ffmpeg_process.kill()
+                                return
+                    except OSError:
+                        ffmpeg_process.kill()
+                        print(f"Client disconnected while streaming {user.current_song}.mp3 at chunk:", user.position)
+                        return
+                    
+                    #updating the position of the song after sending each chunk
+                    with user.lock:
+                        user.position += 1
+                    
+                    with user.lock:
+                        if user.stop_stream:
+                            time.sleep(0.1)
+            
+        finally:
+            ffmpeg_process.wait(timeout=6)
+            ffmpeg_process.terminate()
 
 
         with user.lock:
             user.socket_version += 1
 
+            #checking if there is any song in the queue, if yes then start streaming the next song
             if len(user.queue) > 0:
                 next_song = user.queue.pop(0)
                 user.current_song = next_song
@@ -339,6 +422,7 @@ def stream_song(user):
                 start_next = True
 
             else:
+                #if there is no song in the queue, then set the current song to None and position to 0
                 user.current_song = None
                 user.position = 0
                 return
@@ -346,7 +430,7 @@ def stream_song(user):
         if start_next:
             threading.Thread(
                 target = stream_song,
-                args = (user,)
+                args = (user, ffmpeg_process,)
             ).start()
 
     else:
@@ -371,6 +455,7 @@ def talk_to_client(server_client, address, user):
         try:
             message = server_client.recv(1024).decode()
             if not message:
+                cleanup_user(user)
                 print("client disconnected")
                 break
 
@@ -399,7 +484,9 @@ def talk_to_client(server_client, address, user):
 
 
             elif message.startswith("PLAY|"):
-            
+
+                ffmpeg_process = create_ffmpeg()
+        
                 song_name = message.split("|", 1)[1]
                 
                 #check if the song exists
@@ -422,10 +509,27 @@ def talk_to_client(server_client, address, user):
                         user.position = 0
                         user.stop_stream = False
 
+                    #starting a thread to handle ffmpeg errors
+                    threading.Thread(
+                        target = ffmpeg_errors,
+                        args = (ffmpeg_process,),
+                        daemon=True
+                    ).start()
+
+                    #starting a thread to stream the song to the client
                     thread_play = threading.Thread(
                         target = stream_song,
-                        args = (user,)
-                    )
+                        args = (user, ffmpeg_process,),
+                        daemon=True
+                    ).start()
+
+                    #starting a thread to send PCM data to the client
+                    threading.Thread(
+                        target = send_pcm,
+                        args = (user, ffmpeg_process,),
+                        daemon=True
+                    ).start()
+
 
 
                     played_time = datetime.now().strftime( "%d/%m/%Y, %H:%M:%S")
@@ -442,7 +546,6 @@ def talk_to_client(server_client, address, user):
                     
 
                     user.thread_stream = thread_play
-                    thread_play.start()
 
 
 
@@ -532,7 +635,7 @@ def talk_to_client(server_client, address, user):
 
                         threading.Thread(
                             target = stream_song,
-                            args = (user,)
+                            args = (user, ffmpeg_process,)
                         ).start()
                     else:
                         user.current_song = None
@@ -619,7 +722,7 @@ def talk_to_client(server_client, address, user):
 
                     threading.Thread(
                         target = stream_song,
-                        args = (user,)
+                        args = (user, ffmpeg_process,)
                     ).start()
                     
                 else:
@@ -670,6 +773,12 @@ def talk_to_client(server_client, address, user):
 failed_logins = {}
 active_users = {}
 connection_attempts = {}
+
+threading.Thread(
+    target = heartbeat_monitoring,
+    args = (active_users,),
+    daemon = True
+).start()
 
 while True:
     access = False
@@ -753,6 +862,8 @@ while True:
                     try:
                         if old_socket:
                             old_socket.close()
+                            with user.lock:
+                                user.socket_version += 1
                     except:
                         pass
                     
@@ -762,11 +873,6 @@ while True:
                     with user.lock:
                         user.buffer_health = max(0, user.buffer_health - 20)
 
-                    threading.Thread(
-                        target = stream_song,
-                        args = (user,),
-                        daemon=True
-                    ).start()
 
                 else:
                     auth = False
@@ -797,18 +903,15 @@ while True:
 
             thread = threading.Thread(
                 target = talk_to_client,
-                args = (server_client, address, user)
+                args = (server_client, address, user,)
             )
     
             thread.start()
 
-            
-            threading.Thread(
-                target = heartbeat_monitoring,
-                args = (active_users,),
-                daemon = True
-            ).start()
         else:
+            with user.lock:
+                user.socket_version += 1
+                user.client_socket = server_client
 
             thread = threading.Thread(
                 target = talk_to_client,

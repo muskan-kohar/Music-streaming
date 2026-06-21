@@ -1,0 +1,4 @@
+users.db
+backups/
+cache/
+virt-env

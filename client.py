@@ -43,23 +43,9 @@ threading.Thread(
     daemon = True
 ).start()
         
-pause = False      
+pause = False  
 
 
-ffmpeg_process = subprocess.Popen(
-    [ "ffmpeg",
-    "-i", "pipe:0",
-    "-f", "s16le",
-    "-acodec", "pcm_s16le",
-    "-ac", "2",
-    "-ar", "44100",
-    "pipe:1"
-        ],
-    stdin = subprocess.PIPE,
-    stdout = subprocess.PIPE,
-    stderr = subprocess.PIPE,
-
-)
 p_aud = pyaudio.PyAudio()
 
 for i in range(p_aud.get_device_count()):
@@ -68,48 +54,12 @@ for i in range(p_aud.get_device_count()):
 stream = p_aud.open(
     format = pyaudio.paInt16,
     channels = 2,
-    rate = 44100,
-    output = True
+    rate = 48000,
+    output = True,
+    frames_per_buffer=1024
 
 )
-def get_stream():
-    global pause
-    print("Get stream started")
-    while True:
 
-        while pause:
-            time.sleep(0.1)
-
-
-        audio_chunk = audio_queue.get()
-
-
-        try:
-            ffmpeg_process.stdin.write(audio_chunk)
-            ffmpeg_process.stdin.flush()
-        except Exception as e:
-            print("INPUT ERROR IN FFMPEG:", e)
-            break
-
-
-
-def out_stream():
-    print("Out stream started")
-    while True:
-
-        while pause:
-            time.sleep(0.1)
-
-
-        pcm_bite = ffmpeg_process.stdout.read(1024)
-                
-        if not pcm_bite:
-            continue
-
-        stream.write(pcm_bite)        
-
-
-p_aud = pyaudio.PyAudio()
 
 print("DEVICE:", p_aud.get_device_count())
 
@@ -121,56 +71,66 @@ for i in range(p_aud.get_device_count()):
 print(p_aud.get_default_output_device_info())
 audio_queue = queue.Queue(maxsize=100)
 
-def ffmpeg_errors():
-    for line in ffmpeg_process.stderr:
-        print("FFMPEG:", line.decode(errors="ignore"))
+
+def streaming():
+    print("Started streaming thread")
+    while True:
+
+        if pause:
+            time.sleep(0.1)
+            continue
+
+        
+        chunk = audio_queue.get()
+
+    
+        stream.write(chunk)
+        
 
 threading.Thread(
-    target=ffmpeg_errors,
+    target = streaming,
     daemon=True
 ).start()
-
+    
 
 if auth == "SUCCESS":
     print("Authentication successful. You can access the music library.")
-    threading.Thread(
-        target = get_stream,
-        daemon=True
-    ).start()
 
-    threading.Thread(
-        target = out_stream,
-        daemon= True
-    ).start()
 
-    
+    playing = False
     def recv_song():
-        total = 0
+        total_received = 0
         
-        while True:
-             
-            data = client.recv(4096)
+        global playing
 
+
+        while not playing:
+            time.sleep(0.1)
             
+
+        while True:
+                
+            data = client.recv(1024)
+            total_received += len(data)
+
             if not data:
                 break
 
-            total += len(data)
-
-            if b"EOF" in data:
-                data = data.replace(b"EOF", b"")
-                audio_queue.put(data)
-                print("song completed")
+            if b"END OF SONG" in data:
+                print("\nEND OF SONG\n")
+                data = data.replace(b"END OF SONG", b"")
+                if data:
+                        audio_queue.put(data)
+                        total_received += len(data)
                 break
-
-            audio_queue.put(data, timeout=1)
-
+                    
             
 
-        print("TOTAL RECIEVED:" , total)
 
+            audio_queue.put(data)
 
-    
+        playing = False
+
 
 
     while True:
@@ -190,15 +150,15 @@ if auth == "SUCCESS":
             message = input("Send song name to server:")
             command = "PLAY|" + message
             file_name = message
+            with audio_queue.mutex:
+                audio_queue.queue.clear()
             client.send(command.encode())
-
-            recv_thread = threading.Thread(
+            playing = True
+            threading.Thread(
                 target = recv_song,
-            )
-            print("abhi tak to sab theek hai")
-            recv_thread.start()
-
-            print("starting player thread")
+                daemon=True
+            ).start()
+            
 
 
         elif choice == "2":
@@ -274,7 +234,7 @@ if auth == "SUCCESS":
 
 else:
     print("Authentication failed. Please try again.")
-ffmpeg_process.kill()
+
 stream.close()
 p_aud.terminate()
 client.close()
